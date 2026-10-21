@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stillrunning"
-version = "2.13.6"
+version = "2.13.7"
 description = "AI-powered supply chain security. Blocks malicious packages at install and import time. Works with Claude Code, Cursor, Devin, and every AI coding agent."
 readme = "README.md"
 authors = [

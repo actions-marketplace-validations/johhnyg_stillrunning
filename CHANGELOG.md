@@ -1,5 +1,40 @@
 # Changelog
 
+## 2.13.7 — October 21, 2026 (Session 129)
+
+**Import-time protection works again; `scan`, the import hook and the wrappers no longer report CLEAN on a failure**
+
+### Fixed
+- **Import hook never scanned.** It POSTed to `/api/check-package` (GET-only →
+  HTTP 405 on every call). It now sends a GET and acts on **BLOCKED**, the
+  verdict the API returns (it previously only acted on DANGEROUS). A missing
+  verdict is UNKNOWN, never CLEAN.
+- **Import hook no longer spends the free tier.** Remote import-time checks run
+  only with an API token (`STILLRUNNING_TOKEN` or `token:` in
+  `~/.stillrunning/stillrunning.yaml`); without one it warns once. It looks up
+  the installed *distribution* (not every module name) and remembers each
+  answered result for 24 h per machine (a 429/503 is retried next time).
+  Mapping imports to distributions needs Python 3.10+; on 3.8/3.9 import-time
+  checks are skipped with a one-time warning (install-time checks still run).
+- **`stillrunning scan` exit codes are honest.** The threat API is consulted
+  before the registry (a delisted malicious package is BLOCKED, not "not
+  found"). API errors are no longer reported as CLEAN:
+  `0` not on the blocklist (not a clean bill of health) · `10` BLOCKED ·
+  `11` SUSPICIOUS · `12` daily quota exhausted · `1` could not check
+  (offline / server error / stale data) · `3` not on the registry · `2` timeout.
+- **pip / npm / conda wrappers** block only on a real verdict (10, 11). If the
+  check could not run they print a loud *"NOT checked — installing anyway"*;
+  set `STILLRUNNING_FAIL_CLOSED=1` to stop the install instead.
+- `intercept.py`: a missing verdict is UNKNOWN, never CLEAN.
+
+### Known issue
+- `scan-manifest` (AI scan via `/api/scan`) can still print CLEAN when the AI
+  scan returns nothing (no token / quota / tier). Fix planned for 2.13.8.
+
+### Upgrade note
+Shell wrappers are installed files: after `pip install -U stillrunning`, run
+`stillrunning shell-install` once to update them.
+
 ## Unreleased — August 18, 2026 (Session 122)
 
 **GitHub Action + CI hardening**
