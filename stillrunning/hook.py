@@ -26,6 +26,8 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional
@@ -257,7 +259,9 @@ def _clear_flagged(name: str):
 # ─── Background Scanning ─────────────────────────────────────────────────────
 
 def _get_api_token() -> Optional[str]:
-    """Get stillrunning API token from config or .env."""
+    """Get stillrunning API token from the environment, config or .env."""
+    if os.environ.get("STILLRUNNING_TOKEN"):
+        return os.environ["STILLRUNNING_TOKEN"].strip()
     # Try config file
     if CONFIG_PATH.exists():
         try:
@@ -295,36 +299,56 @@ def _background_scan(package_name: str):
 
     def scan_worker():
         try:
-            # Call stillrunning.io API for scan
+            # v2.13.7: no token is no longer a SILENT skip — warn once.
             token = _get_api_token()
             if not token:
-                # No token — can't scan, just allow
+                # Never spend the anonymous per-IP quota on imports: the
+                # pip/npm wrappers need it for install-time checks.
+                _warn_once("no_token", "import-time checks are OFF — no API token. Set "
+                           "STILLRUNNING_TOKEN or add `token:` to ~/.stillrunning/stillrunning.yaml.")
                 return
+            dist = _distribution_for(package_name)
+            if dist is None:
+                return                      # local / stdlib / vendored module: nothing to look up
+            if _recently_checked(dist):
+                return                      # once per machine per day, not once per process
 
-            url = "https://stillrunning.io/api/check-package"
-            payload = json.dumps({
-                "name": package_name,
-                "ecosystem": "pip",
-                "source": "import_hook"
-            }).encode()
+            # v2.13.7: /api/check-package is GET-only; the old POST got HTTP 405
+            # on every call, so import-time scanning never worked.
+            url = "https://stillrunning.io/api/check-package?" + urllib.parse.urlencode(
+                {"name": dist, "ecosystem": "pip", "source": "import_hook"})
+            headers = {"User-Agent": "stillrunning-hook/2.1"}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+            req = urllib.request.Request(url, headers=headers, method="GET")
 
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                    "User-Agent": "stillrunning-hook/2.0"
-                },
-                method="POST"
-            )
+            answered = False
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = json.loads(resp.read().decode())
+                answered = True
+            except urllib.error.HTTPError as e:
+                # 429 quota / 503 stale-data or scanner error: the body still
+                # carries an honest verdict (UNKNOWN/ERROR) — never "clean".
+                if e.code == 429:
+                    _warn_once("quota", "daily scan quota exhausted — imports are NOT being checked")
+                try:
+                    result = json.loads(e.read().decode())
+                except Exception:
+                    result = {"verdict": "UNKNOWN", "reason": f"HTTP {e.code}"}
 
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read().decode())
-
-            status = result.get("verdict", "CLEAN")
-            score = result.get("score", 0)
-            reason = result.get("reason", "")
+            # v2.13.7: the API answers BLOCKED / SUSPICIOUS / UNKNOWN. BLOCKED
+            # used to fall through (only DANGEROUS was acted on) and a missing
+            # verdict was read as CLEAN.
+            raw = str(result.get("verdict") or "UNKNOWN").upper()
+            status = {"BLOCKED": "DANGEROUS", "DANGEROUS": "DANGEROUS",
+                      "SUSPICIOUS": "SUSPICIOUS"}.get(raw, "UNKNOWN")
+            score = result.get("score", 0) or 0
+            reason = result.get("reason", "") or result.get("agent_message", "")
+            if answered:
+                # only a real 200 answer counts as "checked" for 24 h — a 429
+                # or 503 must not silence the dist until tomorrow
+                _remember_checked(dist, status)
 
             # Cache the result
             with _cache_lock:
@@ -335,7 +359,7 @@ def _background_scan(package_name: str):
                 }
 
             # If suspicious or dangerous, flag for next import
-            if status in ("DANGEROUS", "SUSPICIOUS") or score >= 50:
+            if status in ("DANGEROUS", "SUSPICIOUS"):
                 _save_flagged(name_lower, status, reason)
                 _send_alert(package_name, status, score, reason)
 
@@ -349,6 +373,64 @@ def _background_scan(package_name: str):
     # Start background thread
     thread = threading.Thread(target=scan_worker, daemon=True)
     thread.start()
+
+
+_warned: set = set()
+_warn_lock = threading.Lock()
+SEEN_PATH = Path.home() / ".stillrunning" / "import_checks.json"
+SEEN_TTL = 24 * 3600
+
+
+def _warn_once(key: str, message: str) -> None:
+    """Print a protection warning once per process (never silent, never spammy)."""
+    with _warn_lock:
+        if key in _warned:
+            return
+        _warned.add(key)
+    print(f"[stillrunning] WARNING: {message}", file=sys.stderr)
+
+
+def _distribution_for(import_name: str) -> Optional[str]:
+    """Installed distribution that provides this top-level import (None = not
+    an installed distribution: stdlib, local or vendored code)."""
+    try:
+        import importlib.metadata as md
+        dists = md.packages_distributions().get(import_name) or []
+        return dists[0] if dists else None
+    except Exception as exc:
+        _warn_once("dist_map", f"cannot map imports to distributions ({exc}); import checks skipped")
+        return None
+
+
+def _load_seen() -> dict:
+    try:
+        return json.loads(SEEN_PATH.read_text())
+    except FileNotFoundError:  # lint: allowed-silent(first run: nothing checked yet)
+        return {}
+    except Exception as exc:
+        _warn_once("seen_read", f"import-check cache unreadable ({exc}); re-checking")
+        return {}
+
+
+def _recently_checked(dist: str) -> bool:
+    entry = _load_seen().get(dist.lower())
+    return bool(entry) and time.time() - entry.get("ts", 0) < SEEN_TTL
+
+
+def _remember_checked(dist: str, status: str) -> None:
+    """Persist per machine (24 h) so each distribution costs one API call a day."""
+    try:
+        with _cache_lock:
+            seen = _load_seen()
+            now = time.time()
+            seen = {k: v for k, v in seen.items() if now - v.get("ts", 0) < SEEN_TTL}
+            seen[dist.lower()] = {"status": status, "ts": now}
+            SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SEEN_PATH.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(seen))
+            os.replace(tmp, SEEN_PATH)
+    except Exception as exc:
+        _warn_once("seen_write", f"import-check cache not writable ({exc})")
 
 
 def _send_alert(package: str, status: str, score: int, reason: str):

@@ -30,11 +30,12 @@ except ImportError:
     sys.exit(1)
 
 # Version constant for telemetry — synced from features.json
-VERSION = "2.13.6"
+VERSION = "2.13.7"
 
 # Exit codes (v2.9.0 standardization)
-EXIT_CLEAN = 0
-EXIT_ERROR = 1
+EXIT_CLEAN = 0          # not on the blocklist (NOT a clean bill of health)
+EXIT_ERROR = 1          # the check could not run (offline / server error / stale data)
+EXIT_NOT_FOUND = 3      # name not on the registry (typo, typosquat or private index)
 EXIT_USAGE = 2
 EXIT_BLOCKED = 10
 EXIT_SUSPICIOUS = 11
@@ -2492,7 +2493,8 @@ def _allow_package_local(pkg_name: str, once: bool = False) -> None:
 
 
 def _scan_package(pkg_name: str, npm: bool = False) -> int:
-    """Scan a package for security issues. Returns: 0=CLEAN, 10=BLOCKED, 11=SUSPICIOUS, 1=ERROR."""
+    """Scan a package. Returns 0 not on blocklist, 10 BLOCKED, 11 SUSPICIOUS,
+    12 quota exhausted, 1 could not check, 3 not on the registry, 2 timeout/usage."""
     import signal
     import urllib.parse
     import urllib.request
@@ -2558,68 +2560,87 @@ def _scan_package(pkg_name: str, npm: bool = False) -> int:
     except Exception:
         pass
 
-    # Check the package exists on its registry (v2.13.2: npm support)
+    # v2.13.7: ask the threat API FIRST. A delisted known-malicious package
+    # 404s on the registry, and the old order returned "not found" before the
+    # API could say BLOCKED. Any API failure is "could not check" (exit 1 or
+    # 12) — never CLEAN.
+    api_verdict = None
+    http_failed = False
+    try:
+        from .hook import _get_api_token
+        token = _get_api_token()
+    except Exception:  # lint: allowed-silent(no token source readable → anonymous free tier)
+        token = None
+    try:
+        headers = {"User-Agent": f"stillrunning/{VERSION}"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(
+            "https://stillrunning.io/api/check-package?" + urllib.parse.urlencode(
+                {"name": pkg_name, "ecosystem": ecosystem}),
+            headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"\033[93mWARNING\033[0m: daily scan quota exhausted — {pkg_name} was NOT checked "
+                      f"[exit {EXIT_RATE_LIMITED}]")
+                return EXIT_RATE_LIMITED
+            http_failed = True        # a non-200 answer can block, but can never clear
+            try:
+                result = json.loads(e.read().decode())     # 503 stale/scanner error carry a verdict body
+            except Exception:
+                result = {"verdict": "ERROR", "reason": f"HTTP {e.code}"}
+        api_verdict = str(result.get("verdict") or "UNKNOWN").upper()
+        reason = result.get("reason", "") or result.get("agent_message", "")
+    except urllib.error.URLError:
+        print(f"\033[93mWARNING\033[0m: stillrunning.io unreachable — {pkg_name} was NOT checked [exit {EXIT_ERROR}]")
+        return EXIT_ERROR
+    except Exception as e:
+        print(f"\033[93mWARNING\033[0m: threat check failed ({e}) — {pkg_name} was NOT checked [exit {EXIT_ERROR}]")
+        return EXIT_ERROR
+
+    if api_verdict == "BLOCKED":
+        print(f"✗ stillrunning BLOCKED [exit {EXIT_BLOCKED}]: {pkg_name}")
+        print(f"   Reason: {reason or 'Security threat detected'}")
+        print(f"   See: https://stillrunning.io/security-advisories?pkg={pkg_name}")
+        return EXIT_BLOCKED
+    if api_verdict == "SUSPICIOUS":
+        print(f"⚠ stillrunning SUSPICIOUS [exit {EXIT_SUSPICIOUS}]: {pkg_name}")
+        print(f"   Reason: {reason or 'Potential security concern'}")
+        print(f"   Review carefully before installing.")
+        return EXIT_SUSPICIOUS
+    if (api_verdict != "UNKNOWN" or http_failed
+            or result.get("status") in ("stale_data", "error", "degraded")):
+        # ERROR / stale data / non-200 / anything unexpected: the check did not complete.
+        print(f"\033[93mWARNING\033[0m: threat data unavailable ({reason or api_verdict}) — "
+              f"{pkg_name} was NOT checked [exit {EXIT_ERROR}]")
+        return EXIT_ERROR
+
+    # Not on the blocklist. Does the name exist at all? (typos / typosquats)
     if npm:
         registry_name = "npm"
-        # scoped names (@scope/pkg) need the slash encoded for the registry URL
         url = f"https://registry.npmjs.org/{urllib.parse.quote(pkg_name, safe='@')}"
     else:
         registry_name = "PyPI"
-        url = f"https://pypi.org/pypi/{pkg_name}/json"
+        url = f"https://pypi.org/pypi/{urllib.parse.quote(pkg_name, safe='')}/json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "stillrunning/2.3.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            json.loads(resp.read().decode())
+        req = urllib.request.Request(url, headers={"User-Agent": f"stillrunning/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=10):
+            pass
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            print(f"\033[91mERROR\033[0m: Package '{pkg_name}' not found on {registry_name}")
-            return EXIT_ERROR
-        print(f"\033[91mERROR\033[0m: {registry_name} returned HTTP {e.code}")
-        return EXIT_ERROR
-    except urllib.error.URLError:
-        print(f"\033[91mERROR\033[0m: Unable to reach {registry_name}")
-        return EXIT_ERROR
+            print(f"? '{pkg_name}' is not on {registry_name} [exit {EXIT_NOT_FOUND}] — check the spelling "
+                  f"(or it comes from a private index).")
+            return EXIT_NOT_FOUND
+        print(f"   ({registry_name} existence check returned HTTP {e.code} — skipped)")
     except Exception as e:
-        print(f"\033[91mERROR\033[0m: {e}")
-        return EXIT_ERROR
+        print(f"   ({registry_name} existence check unavailable: {type(e).__name__} — skipped)")
 
-    # Call the API for AI review
-    try:
-        api_url = "https://stillrunning.io/api/check-package"
-        req = urllib.request.Request(
-            f"{api_url}?name={urllib.parse.quote(pkg_name)}&ecosystem={ecosystem}",
-            headers={"User-Agent": "stillrunning/2.3.0"}
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            result = json.loads(resp.read().decode())
-
-        verdict = result.get("verdict", "UNKNOWN")
-        reason = result.get("reason", "")
-
-        if verdict == "BLOCKED":
-            print(f"✗ stillrunning BLOCKED [exit {EXIT_BLOCKED}]: {pkg_name}")
-            print(f"   Reason: {reason or 'Security threat detected'}")
-            print(f"   See: https://stillrunning.io/security-advisories?pkg={pkg_name}")
-            return EXIT_BLOCKED
-        elif verdict == "SUSPICIOUS":
-            print(f"⚠ stillrunning SUSPICIOUS [exit {EXIT_SUSPICIOUS}]: {pkg_name}")
-            print(f"   Reason: {reason or 'Potential security concern'}")
-            print(f"   Review carefully before installing.")
-            return EXIT_SUSPICIOUS
-        elif verdict == "CLEAN":
-            print(f"✓ stillrunning CLEAN [exit {EXIT_CLEAN}]: {pkg_name}")
-            print(f"   Package appears safe to install.")
-            return EXIT_CLEAN
-        else:
-            print(f"✓ stillrunning CLEAN [exit {EXIT_CLEAN}]: {pkg_name}")
-            print(f"   Not on blocklist. Package exists on PyPI.")
-            return EXIT_CLEAN
-
-    except Exception as e:
-        print(f"✓ stillrunning CLEAN [exit {EXIT_CLEAN}]: {pkg_name}")
-        print(f"   Not on blocklist. Package exists on PyPI.")
-        print(f"   (API check unavailable)")
-        return EXIT_CLEAN
+    print(f"✓ stillrunning: {pkg_name} is not on the blocklist [exit {EXIT_CLEAN}]")
+    print(f"   This is not a clean bill of health — only that no known advisory matches.")
+    return EXIT_CLEAN
 
 
 def _scan_manifest(path_str: str) -> int:
@@ -2821,6 +2842,29 @@ _SHELL_ACTIVATE_END = "# <<< stillrunning shell hooks <<<"
 _WRAPPER_SCRIPT_PIP = '''#!/bin/bash
 # stillrunning pip wrapper — checks packages before install
 set -e
+
+# v2.13.7: only a real verdict blocks. 10 = BLOCKED, 11 = SUSPICIOUS. 0 / 13 /
+# 3 (not on the registry — pip/npm will report it) continue. Anything else
+# means the check could NOT run (1 error/offline/stale, 12 quota, 127 CLI
+# missing): warn loudly and allow, unless STILLRUNNING_FAIL_CLOSED=1.
+__stillrunning_verdict() {
+    local pkg="$1" rc="$2"
+    case "$rc" in
+        0|13) return 0 ;;
+        3) echo "stillrunning: note — '$pkg' is not on the public registry (typo? private index?)." >&2; return 0 ;;
+        10) echo "stillrunning: BLOCKED '$pkg' — known malicious. See https://stillrunning.io/blocked?pkg=$pkg" >&2; return 1 ;;
+        11) echo "stillrunning: BLOCKED '$pkg' — suspicious. Review: https://stillrunning.io/blocked?pkg=$pkg" >&2; return 1 ;;
+        12) why="daily scan quota exhausted" ;;
+        127) why="the stillrunning CLI is not installed or not on PATH" ;;
+        *) why="the check could not run (offline or server error, exit $rc)" ;;
+    esac
+    if [[ "${STILLRUNNING_FAIL_CLOSED:-0}" == "1" ]]; then
+        echo "stillrunning: install of '$pkg' stopped — $why (STILLRUNNING_FAIL_CLOSED=1)." >&2
+        return 1
+    fi
+    echo "stillrunning: WARNING — '$pkg' was NOT checked: $why. Installing anyway (set STILLRUNNING_FAIL_CLOSED=1 to stop instead)." >&2
+    return 0
+}
 if [[ "$1" == "install" || "$1" == "download" ]]; then
     subcmd="$1"
     shift
@@ -2832,10 +2876,9 @@ if [[ "$1" == "install" || "$1" == "download" ]]; then
         [[ -n "$pkg" ]] && packages+=("$pkg")
     done
     for pkg in "${packages[@]}"; do
-        if ! stillrunning scan "$pkg" >/dev/null 2>&1; then
-            echo "stillrunning: Package '$pkg' blocked. See https://stillrunning.io/blocked?pkg=$pkg"
-            exit 1
-        fi
+        rc=0
+        stillrunning scan "$pkg" >/dev/null 2>&1 || rc=$?
+        __stillrunning_verdict "$pkg" "$rc" || exit 1
     done
     exec /usr/bin/pip "$subcmd" "$@"
 else
@@ -2846,6 +2889,29 @@ fi
 _WRAPPER_SCRIPT_NPM = '''#!/bin/bash
 # stillrunning npm wrapper — checks packages before install
 set -e
+
+# v2.13.7: only a real verdict blocks. 10 = BLOCKED, 11 = SUSPICIOUS. 0 / 13 /
+# 3 (not on the registry — pip/npm will report it) continue. Anything else
+# means the check could NOT run (1 error/offline/stale, 12 quota, 127 CLI
+# missing): warn loudly and allow, unless STILLRUNNING_FAIL_CLOSED=1.
+__stillrunning_verdict() {
+    local pkg="$1" rc="$2"
+    case "$rc" in
+        0|13) return 0 ;;
+        3) echo "stillrunning: note — '$pkg' is not on the public registry (typo? private index?)." >&2; return 0 ;;
+        10) echo "stillrunning: BLOCKED '$pkg' — known malicious. See https://stillrunning.io/blocked?pkg=$pkg" >&2; return 1 ;;
+        11) echo "stillrunning: BLOCKED '$pkg' — suspicious. Review: https://stillrunning.io/blocked?pkg=$pkg" >&2; return 1 ;;
+        12) why="daily scan quota exhausted" ;;
+        127) why="the stillrunning CLI is not installed or not on PATH" ;;
+        *) why="the check could not run (offline or server error, exit $rc)" ;;
+    esac
+    if [[ "${STILLRUNNING_FAIL_CLOSED:-0}" == "1" ]]; then
+        echo "stillrunning: install of '$pkg' stopped — $why (STILLRUNNING_FAIL_CLOSED=1)." >&2
+        return 1
+    fi
+    echo "stillrunning: WARNING — '$pkg' was NOT checked: $why. Installing anyway (set STILLRUNNING_FAIL_CLOSED=1 to stop instead)." >&2
+    return 0
+}
 if [[ "$1" == "install" || "$1" == "i" || "$1" == "add" ]]; then
     subcmd="$1"
     shift
@@ -2860,10 +2926,9 @@ if [[ "$1" == "install" || "$1" == "i" || "$1" == "add" ]]; then
         if [[ "$pkg" == @anthropic-ai/* ]]; then
             continue   # trusted scope, skip scan
         fi
-        if ! stillrunning scan "$pkg" --npm >/dev/null 2>&1; then
-            echo "stillrunning: Package '$pkg' blocked. See https://stillrunning.io/blocked?pkg=$pkg"
-            exit 1
-        fi
+        rc=0
+        stillrunning scan "$pkg" --npm >/dev/null 2>&1 || rc=$?
+        __stillrunning_verdict "$pkg" "$rc" || exit 1
     done
     exec /usr/bin/npm "$subcmd" "$@"
 else
@@ -2905,6 +2970,25 @@ export -f python
 
 _CONDA_ACTIVATE_SCRIPT = '''#!/bin/bash
 # stillrunning conda hook — wraps conda install
+__stillrunning_verdict() {
+    local pkg="$1" rc="$2"
+    case "$rc" in
+        0|13) return 0 ;;
+        3) echo "stillrunning: note — '$pkg' is not on the public registry (typo? private index?)." >&2; return 0 ;;
+        10) echo "stillrunning: BLOCKED '$pkg' — known malicious. See https://stillrunning.io/blocked?pkg=$pkg" >&2; return 1 ;;
+        11) echo "stillrunning: BLOCKED '$pkg' — suspicious. Review: https://stillrunning.io/blocked?pkg=$pkg" >&2; return 1 ;;
+        12) why="daily scan quota exhausted" ;;
+        127) why="the stillrunning CLI is not installed or not on PATH" ;;
+        *) why="the check could not run (offline or server error, exit $rc)" ;;
+    esac
+    if [[ "${STILLRUNNING_FAIL_CLOSED:-0}" == "1" ]]; then
+        echo "stillrunning: install of '$pkg' stopped — $why (STILLRUNNING_FAIL_CLOSED=1)." >&2
+        return 1
+    fi
+    echo "stillrunning: WARNING — '$pkg' was NOT checked: $why. Installing anyway (set STILLRUNNING_FAIL_CLOSED=1 to stop instead)." >&2
+    return 0
+}
+
 # Auto-installed by stillrunning shell-install
 
 _original_conda=$(which -a conda 2>/dev/null | grep -v stillrunning | head -1)
@@ -2921,10 +3005,9 @@ function conda() {
             packages+=("$arg")
         done
         for pkg in "${packages[@]}"; do
-            if ! stillrunning scan "$pkg" >/dev/null 2>&1; then
-                echo "stillrunning: Package '$pkg' blocked. See https://stillrunning.io/blocked?pkg=$pkg"
-                return 1
-            fi
+            rc=0
+            stillrunning scan "$pkg" >/dev/null 2>&1 || rc=$?
+            __stillrunning_verdict "$pkg" "$rc" || return 1
         done
         "$_original_conda" "$cmd" "$@"
     else

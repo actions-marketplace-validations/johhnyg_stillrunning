@@ -306,11 +306,12 @@ def call_ai_scan(package: str, ecosystem: str = "pip") -> tuple[str, str] | None
         if "error" in result:
             return None
 
-        verdict = result.get("verdict", "CLEAN")
+        # v2.13.7: a missing verdict is UNKNOWN, never CLEAN; BLOCKED is acted on.
+        verdict = str(result.get("verdict") or "UNKNOWN").upper()
         score = result.get("score", 0)
         reasons = result.get("reasons", [])
 
-        if verdict == "DANGEROUS":
+        if verdict in ("DANGEROUS", "BLOCKED"):
             reason = reasons[0] if reasons else f"AI review: dangerous (score {score})"
             return "BLOCKED", reason
         elif verdict == "SUSPICIOUS":

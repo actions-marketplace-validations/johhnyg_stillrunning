@@ -133,8 +133,10 @@ Disable: `STILLRUNNING_NO_TELEMETRY=1` or `--no-telemetry` flag.
 |----------|---------|
 | `STILLRUNNING_NO_TELEMETRY=1` | Disable heartbeat |
 | `BLOCKLIST_MAX_AGE_DAYS=730` | Max age for blocklist entries (default 2 years) |
+| `STILLRUNNING_TOKEN` | API token (enables import-time checks) |
+| `STILLRUNNING_FAIL_CLOSED=1` | Wrappers stop the install when a package could not be checked |
 
-Config file: `~/.stillrunning/config.yaml`
+Token file: `~/.stillrunning/stillrunning.yaml` (`token: ...`)
 
 ## Commands
 
